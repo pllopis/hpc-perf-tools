@@ -1,0 +1,136 @@
+#!/usr/bin/python
+from __future__ import print_function  
+import errno
+import signal
+import sys
+import argparse
+from time import sleep
+from collections import Counter
+from functools import reduce
+from bcc import BPF, PerfSWConfig, PerfType
+
+stop = False
+def signal_stop(signal, frame):
+	global stop
+	stop = True
+
+signal.signal(signal.SIGINT, signal_stop)
+
+parser = argparse.ArgumentParser(description="Profile to obtain the top running symbol")
+sampling_group = parser.add_mutually_exclusive_group()
+sampling_group.add_argument("-f", "--frequency", type=int, default=49,
+	help="Sampling frequency in Hz")
+sampling_group.add_argument("-t", "--period", type=int,
+	help="Sampling time period, in perf cpu-clock events")
+parser.add_argument("-d", "--duration", type=int, default=5,
+	help="Duration of the trace in seconds")
+parser.add_argument("-i", "--idle", action="store_true",
+	help="Include idle/off-cpu stacks (i.e. pid 0)")
+parser.add_argument("-p", "--pid", type=int,
+	help="Restrict tracing to this PID. If no PID is provided, all non-zero PIDs are traced.")
+parser.add_argument("-c", "--cpu", type=int,
+	help="Restrict tracing to this cpu.")
+parser.add_argument("-r", "--repeat", type=int, default=1,
+	help="Repeat the tracing measurement this many times.")
+parser.add_argument("-n", "--numsymbols", type=int, default=1,
+	help="For every trace, print the top n symbols")
+parser.add_argument("-v", "--verbose", action="store_true",
+	help="Produce verbose output")
+args = parser.parse_args()
+
+if args.cpu:
+	cpu = args.cpu
+else:
+	cpu = -1 # perf_events speak for all cpus
+
+if args.frequency:
+	args.period = 0
+else:
+	args.frequency = 0
+
+if args.pid is not None:
+	pid_filter = 'pid == %s' % args.pid
+else:
+	pid_filter = '1'
+
+if args.idle is not None:
+	idle_filter = '0'
+else:
+	idle_filter = 'pid == 0'
+
+if args.verbose:
+	print('Initializing..')
+
+bpf_source = """
+#include <uapi/linux/ptrace.h>
+#include <uapi/linux/bpf_perf_event.h>
+#include <linux/sched.h>
+
+struct trace_t {
+  u32 pid;
+  int stack_id;
+};
+
+BPF_HASH(cache, struct trace_t);
+BPF_STACK_TRACE(traces, 16384);
+
+int collect_stack_traces(struct bpf_perf_event_data *ctx) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+  if (IDLE_FILTER) // for off-cpu
+    return 0;
+
+  if (!(PID_FILTER))
+    return 0;
+
+  struct trace_t trace = {
+    .pid = pid,
+    .stack_id = traces.get_stackid(&ctx->regs, BPF_F_USER_STACK)
+  };
+
+  cache.increment(trace);
+  return 0;
+}
+"""
+
+bpf_source = bpf_source.replace('PID_FILTER', pid_filter)
+bpf_source = bpf_source.replace('IDLE_FILTER', idle_filter)
+bpf = BPF(text=bpf_source)
+bpf.attach_perf_event(ev_type=PerfType.SOFTWARE,
+                      ev_config=PerfSWConfig.CPU_CLOCK,
+                      fn_name='collect_stack_traces',
+                      sample_period=args.period, sample_freq=args.frequency, cpu=cpu)
+
+for _ in xrange(args.repeat):
+	if args.verbose:
+		print("Collecting data during %s seconds.." % args.duration)
+
+	sleep(args.duration)
+
+	cache = bpf.get_table('cache')
+	traces = bpf.get_table('traces')
+
+	if args.verbose:
+		print("Processing %s traces.." % len(traces))
+
+	symbolCnt = Counter()
+	for trace, acc in cache.items():
+		if trace.stack_id >= 0:
+			stack_trace = list(traces.walk(trace.stack_id))
+			for stack_address in stack_trace:
+				function_name = bpf.sym(stack_address, trace.pid).decode('utf-8')
+				if function_name == '[unknown]':
+					continue
+				symbolCnt[function_name] += acc.value
+
+	cache.clear()
+	sorted_items = sorted(symbolCnt.items(), key=lambda item: item[1], reverse=True)
+
+	numtraces = 0
+	for item in sorted_items:
+		numtraces += item[1]
+	for item in sorted_items[:args.numsymbols]:
+		top_symbol = item[0]
+		top_symbol_freq = item[1]
+		print("{} {:.2f}%".format(top_symbol, 100*top_symbol_freq/float(numtraces)))
+	if stop:
+		exit()

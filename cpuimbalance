@@ -126,8 +126,6 @@ parser.add_argument("-n", "--number", type=int, default=1,
 	help="Number of readings (each between --interval seconds)")
 parser.add_argument("-r", "--reverse", action="store_true",
 	help="Reverse operation: measure balance instead of imbalance")
-parser.add_argument("--smt", action="store_true",
-	help="Assume physical core utilization can be > 1 due to SMT. Default max per physical core is otherwise 1.")
 args = parser.parse_args()
 
 for n in range(args.number):

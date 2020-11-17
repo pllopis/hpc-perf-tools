@@ -106,9 +106,11 @@ def compute_imbalance(cpu_util, topology):
 	if args.verbose:
 		print('cpu utilization balance', balance)
 		print('mean', mean(balance), 'stdev', pstdev(balance))
-	# scale values to range [0, sqrt(2)]
-	# (sqrt(2) is the max value possible as per cpu_topology)
-	balance = scale(balance, 0, 2**(1/2))
+	# We scale values to be in the inteval [0, 1].
+	# The minval is always 0.
+	# The maxval is at least 1, but can be above 1 if there was enough SMT use.
+	maxval = max(balance + [1])
+	balance = scale(balance, 0, maxval)
 	if args.verbose:
 		print('scaled balance', balance)
 	# return the normalized dispersion using the coefficient of variation
@@ -124,11 +126,12 @@ parser.add_argument("-n", "--number", type=int, default=1,
 	help="Number of readings (each between --interval seconds)")
 parser.add_argument("-r", "--reverse", action="store_true",
 	help="Reverse operation: measure balance instead of imbalance")
+parser.add_argument("--smt", action="store_true",
+	help="Assume physical core utilization can be > 1 due to SMT. Default max per physical core is otherwise 1.")
 args = parser.parse_args()
 
 for n in range(args.number):
 	cpu_util = psutil.cpu_percent(args.interval, percpu=True)
-	cpu_util = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0, ]
 	if args.verbose:
 		print('processors utilization:')
 		print(cpu_util)

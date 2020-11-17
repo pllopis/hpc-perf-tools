@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+import psutil
+import argparse
+from statistics import mean, pstdev
+from pprint import pprint
+from time import sleep
+
+def physical_package_id(processor):
+	with open('/sys/devices/system/cpu/cpu{}/topology/physical_package_id'.format(processor)) as f:
+		line = f.read()
+	return int(line)
+
+def physical_core_id(processor):
+	with open('/sys/devices/system/cpu/cpu{}/topology/core_id'.format(processor)) as f:
+		line = f.read()
+	return int(line)
+
+class Package(dict):
+	pass
+
+class Core(list):
+	pass
+
+def cpu_topology(num_processors):
+	"""
+	Builds a cpu topology object.
+	Input: the number of processors (what linux also calls cpus, which are really hw-threads).
+	Returns: a topology (dict) where each key is a package id, and the value is a package.
+	A package is also represented as a dict. Each key is a core id, and the value is a list
+	of processor numbers belonging to that physical core.
+	Processor numbers are system-wide, and go from 0 to num_processors-1.
+	Core ids are only unique per package.
+	"""
+	topology = {}
+	for processor in range(num_processors):
+		package_id = physical_package_id(processor)
+		core_id = physical_core_id(processor)
+		
+		if package_id in topology:
+			package = topology[package_id]
+		else:
+			topology[package_id] = Package()
+			package = topology[package_id]
+
+		if core_id in package:
+			package[core_id].append(processor)
+		else:
+			package[core_id] = Core([processor])
+	return topology
+
+
+def cpu_balance(cpu_util, topology):
+	"""
+	Compute the CPU balance taking into account the topology.
+	Inputs:
+		cpu_util: an array of processor utilization. Values in range [0.0, 1.0]
+		topology: the topology dict as returned by cpu_topology()
+		The cpu topology is represented as a tree in which the leafs are processors (hw-threads),
+		cores are lists of processors, and packages are a collection(dict) of cores.
+	Returns:
+		A generator of a list of values, one per cpu package, representing the aggregated utilization.
+	The more equal the utilization values per package, the more balanced the utilization.
+	Utilization values are aggregated taking into account the cpu topology, as follows:
+	The algorithm walks the topology tree depth-first.
+	Sibling processors that belong to the same physical core are added up. To account for
+	the reduced scaling of SMT, if the utilization is greater than 1, the sqrt of this
+	number is computed.
+	Cores are aggregated by adding the values together, and normalized by dividing by
+	the amount of cores in the corresponding package.
+	This yields the list of per-package utilization aggregations.
+	"""
+	balance_package = {}
+	for key, item in topology.items():
+		if isinstance(item, Package):
+			balance_cores = [balance_core for balance_core in cpu_balance(cpu_util, item)]
+			# normalize utilization of all cores into a single value
+			yield float(sum(balance_cores))/len(balance_cores)
+		elif isinstance(item, Core):
+			util_sum = sum([cpu_util[processor] for processor in item])
+			if util_sum > 1:
+				# Account for SMT.
+				# take the nth root of the sum of items,
+				# where n is len(item)
+				yield util_sum**(1.0/float(len(item)))
+			else:
+				yield util_sum
+
+
+def scale(values, minval, maxval):
+	"""
+	Scale values into the range [0, 1]
+	"""
+	return [(x - minval)/(maxval - minval) for x in values]
+
+
+def compute_imbalance(cpu_util, topology):
+	"""
+	Compute the cpu imbalance.
+	The cpu_balance function already gives us a per-package
+	aggregation, but we want to give a single, objective, and
+	easy to interpret metric about how imbalanced the system is.
+	Therefore, normalize all values by scaling them, and produce
+	a single value of imbalance between 0..1
+	"""
+	balance = list(cpu_balance(cpu_util, topology))
+	if args.verbose:
+		print('cpu utilization balance', balance)
+		print('mean', mean(balance), 'stdev', pstdev(balance))
+	# scale values to range [0, sqrt(2)]
+	# (sqrt(2) is the max value possible as per cpu_topology)
+	balance = scale(balance, 0, 2**(1/2))
+	if args.verbose:
+		print('scaled balance', balance)
+	# return the normalized dispersion using the coefficient of variation
+	return pstdev(balance)/mean(balance)
+
+
+parser = argparse.ArgumentParser(description="Obtain CPU utilization imbalance. Represents imbalance in range [0.0, 1.0]")
+parser.add_argument("-v", "--verbose", action="store_true",
+	help="Produce verbose output")
+parser.add_argument("-i", "--interval", type=int, default=1,
+	help="Time interval between measurements in seconds")
+parser.add_argument("-n", "--number", type=int, default=1,
+	help="Number of readings (each between --interval seconds)")
+parser.add_argument("-r", "--reverse", action="store_true",
+	help="Reverse operation: measure balance instead of imbalance")
+args = parser.parse_args()
+
+for n in range(args.number):
+	cpu_util = psutil.cpu_percent(args.interval, percpu=True)
+	cpu_util = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0, 0, ]
+	if args.verbose:
+		print('processors utilization:')
+		print(cpu_util)
+	num_processors = len(cpu_util)
+	topology = cpu_topology(num_processors)
+	if args.verbose:
+		print('raw cpu topology:')
+		pprint(topology)
+	imbalance = compute_imbalance(cpu_util, topology)
+	if args.reverse:
+		print('{:.2f}'.format(1-imbalance))
+	else:
+		print('{:.2f}'.format(imbalance))

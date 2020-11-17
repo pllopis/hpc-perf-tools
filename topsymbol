@@ -16,7 +16,9 @@ def signal_stop(signal, frame):
 
 signal.signal(signal.SIGINT, signal_stop)
 
-parser = argparse.ArgumentParser(description="Profile to obtain the top running symbol")
+parser = argparse.ArgumentParser(
+	description="Profile to obtain the top running symbol",
+	formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 sampling_group = parser.add_mutually_exclusive_group()
 sampling_group.add_argument("-f", "--frequency", type=int, default=49,
 	help="Sampling frequency in Hz")

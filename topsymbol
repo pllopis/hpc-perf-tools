@@ -3,11 +3,13 @@ from __future__ import print_function
 import errno
 import signal
 import sys
+import os
 import argparse
 from time import sleep
 from collections import Counter
 from functools import reduce
 from bcc import BPF, PerfSWConfig, PerfType
+from bcc.libbcc import lib, bcc_symbol, bcc_symbol_option, bcc_stacktrace_build_id, _SYM_CB_TYPE
 
 stop = False
 def signal_stop(signal, frame):
@@ -15,6 +17,40 @@ def signal_stop(signal, frame):
 	stop = True
 
 signal.signal(signal.SIGINT, signal_stop)
+
+
+def symdso(addr, pid):
+	"""
+	based on BPF.sym() but modified to return the tuple (symbol, dso)
+        """
+
+        #addr is of type stacktrace_build_id
+        #so invoke the bsym address resolver
+        typeofaddr = str(type(addr))
+        if typeofaddr.find('bpf_stack_build_id') != -1:
+          sym = bcc_symbol()
+          b = bcc_stacktrace_build_id()
+          b.status = addr.status
+          b.build_id = addr.build_id
+          b.u.offset = addr.offset;
+          res = lib.bcc_buildsymcache_resolve(BPF._bsymcache,
+                                              ct.byref(b),
+                                              ct.byref(sym))
+          if res < 0:
+            if sym.module and sym.offset:
+              name,offset,module = (None, sym.offset,
+                        ct.cast(sym.module, ct.c_char_p).value)
+            else:
+              name, offset, module = (None, addr, None)
+          else:
+            name, offset, module = (sym.name, sym.offset,
+                                    ct.cast(sym.module, ct.c_char_p).value)
+        else:
+          name, offset, module = BPF._sym_cache(pid).resolve(addr, True)
+
+        name = name or b"[unknown]"
+        module = os.path.basename(module) if module is not None else None
+        return name, module
 
 parser = argparse.ArgumentParser(
 	description="Profile to obtain the top running symbol",
@@ -32,10 +68,14 @@ parser.add_argument("-p", "--pid", type=int,
 	help="Restrict tracing to this PID. If no PID is provided, all non-zero PIDs are traced.")
 parser.add_argument("-c", "--cpu", type=int,
 	help="Restrict tracing to this cpu.")
+parser.add_argument("-C", "--command", type=str,
+	help="Restrict tracing to this command (process name, without path)")
 parser.add_argument("-r", "--repeat", type=int, default=1,
 	help="Repeat the tracing measurement this many times.")
 parser.add_argument("-n", "--numsymbols", type=int, default=1,
 	help="For every trace, print the top n symbols")
+parser.add_argument("--dso", action="store_true",
+	help="Instead of symbols, profile Dynamic Shared Objects")
 parser.add_argument("-v", "--verbose", action="store_true",
 	help="Produce verbose output")
 args = parser.parse_args()
@@ -71,6 +111,7 @@ bpf_source = """
 struct trace_t {
   u32 pid;
   int stack_id;
+  char name[TASK_COMM_LEN];
 };
 
 BPF_HASH(cache, struct trace_t);
@@ -78,6 +119,7 @@ BPF_STACK_TRACE(traces, 16384);
 
 int collect_stack_traces(struct bpf_perf_event_data *ctx) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
+
   if (IDLE_FILTER) // for off-cpu
     return 0;
 
@@ -88,6 +130,7 @@ int collect_stack_traces(struct bpf_perf_event_data *ctx) {
     .pid = pid,
     .stack_id = traces.get_stackid(&ctx->regs, BPF_F_USER_STACK)
   };
+  bpf_get_current_comm(&trace.name, sizeof(trace.name));
 
   cache.increment(trace);
   return 0;
@@ -115,24 +158,33 @@ for _ in xrange(args.repeat):
 		print("Processing %s traces.." % len(traces))
 
 	symbolCnt = Counter()
+	dsoCnt = Counter()
 	for trace, acc in cache.items():
 		if trace.stack_id >= 0:
+			if args.command and args.command != trace.name:
+				continue
 			stack_trace = list(traces.walk(trace.stack_id))
 			for stack_address in stack_trace:
-				function_name = bpf.sym(stack_address, trace.pid).decode('utf-8')
+				s, dso = symdso(stack_address, trace.pid)
+				function_name = s.decode('utf-8')
 				if function_name == '[unknown]':
 					continue
 				symbolCnt[function_name] += acc.value
+				if dso is not None:
+					dsoCnt[dso] += acc.value
 
 	cache.clear()
-	sorted_items = sorted(symbolCnt.items(), key=lambda item: item[1], reverse=True)
+	if args.dso:
+		sorted_items = sorted(dsoCnt.items(), key=lambda item: item[1], reverse=True)
+	else:
+		sorted_items = sorted(symbolCnt.items(), key=lambda item: item[1], reverse=True)
 
 	numtraces = 0
 	for item in sorted_items:
 		numtraces += item[1]
 	for item in sorted_items[:args.numsymbols]:
-		top_symbol = item[0]
-		top_symbol_freq = item[1]
-		print("{} {:.2f}%".format(top_symbol, 100*top_symbol_freq/float(numtraces)))
+		top_item = item[0]
+		top_item_freq = item[1]
+		print("{} {:.2f}%".format(top_item, 100*top_item_freq/float(numtraces)))
 	if stop:
 		exit()

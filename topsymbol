@@ -68,8 +68,8 @@ parser.add_argument("-p", "--pid", type=int,
 	help="Restrict tracing to this PID. If no PID is provided, all non-zero PIDs are traced.")
 parser.add_argument("-c", "--cpu", type=int,
 	help="Restrict tracing to this cpu.")
-parser.add_argument("-C", "--command", type=str,
-	help="Restrict tracing to this command (process name, without path)")
+parser.add_argument("-P", "--program", type=str,
+	help="Restrict tracing to this program name (without path)")
 parser.add_argument("-r", "--repeat", type=int, default=1,
 	help="Repeat the tracing measurement this many times.")
 parser.add_argument("-n", "--numsymbols", type=int, default=1,
@@ -161,7 +161,7 @@ for _ in xrange(args.repeat):
 	dsoCnt = Counter()
 	for trace, acc in cache.items():
 		if trace.stack_id >= 0:
-			if args.command and args.command != trace.name:
+			if args.program and args.program != trace.name:
 				continue
 			stack_trace = list(traces.walk(trace.stack_id))
 			for stack_address in stack_trace:
